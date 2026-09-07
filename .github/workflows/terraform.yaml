@@ -30,11 +30,11 @@ jobs:
           terraform_wrapper: false
 
       - name: Configure AWS
-        uses: aws-actions/configure-aws-credentials@v6
+        uses: aws-actions/configure-aws-credentials@v6.2.3
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_REGION }}
+          role-to-assume: ${{ secrets.AWS_PLAN_ROLE_ARN }}
+          role-session-name: plan-session
+          aws-region: ${{ vars.AWS_REGION }}
 
       - name: Terraform format
         id: fmt
