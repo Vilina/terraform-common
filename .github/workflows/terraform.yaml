@@ -34,7 +34,7 @@ jobs:
         with:
           role-to-assume: ${{ secrets.AWS_PLAN_ROLE_ARN }}
           role-session-name: plan-session
-          aws-region: ${{ vars.AWS_REGION }}
+          aws-region: ${{ secrets.AWS_REGION }}
 
       - name: Terraform format
         id: fmt
