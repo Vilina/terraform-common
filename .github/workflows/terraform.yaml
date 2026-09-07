@@ -1,0 +1,130 @@
+name: Terraform CI
+
+on:
+  pull_request:
+    branches: [main]
+
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  TF_IN_AUTOMATION: true
+  TF_INPUT: false
+
+jobs:
+  terraform:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ vars.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Configure AWS
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Terraform format
+        id: fmt
+        continue-on-error: true
+        run: terraform fmt -check -recursive
+
+      - name: Terraform init
+        id: init
+        continue-on-error: true
+        run: terraform init -input=false
+
+      - name: Terraform validate
+        id: validate
+        continue-on-error: true
+        run: terraform validate -no-color
+
+      - name: Terraform plan
+        id: plan
+        continue-on-error: true
+        run: |
+          terraform plan \
+            -input=false \
+            -no-color \
+            -out=tfplan
+
+          terraform show -no-color tfplan > plan.txt
+
+      - name: Create report
+        if: always()
+        run: |
+          {
+            echo "<!-- terraform-ci:start -->"
+            echo "## Terraform CI"
+            echo ""
+            echo "| Check | Result |"
+            echo "| --- | --- |"
+            echo "| Format | ${{ steps.fmt.outcome }} |"
+            echo "| Init | ${{ steps.init.outcome }} |"
+            echo "| Validate | ${{ steps.validate.outcome }} |"
+            echo "| Plan | ${{ steps.plan.outcome }} |"
+            echo ""
+            echo "<details>"
+            echo "<summary>Terraform Plan</summary>"
+            echo ""
+            echo '```text'
+            head -c 20000 plan.txt 2>/dev/null || echo "Plan unavailable"
+            echo '```'
+            echo "</details>"
+            echo ""
+            echo "<!-- terraform-ci:end -->"
+          } > terraform-report.md
+
+          cat terraform-report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Update PR description
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+
+          gh pr view "$PR_NUMBER" --json body --jq '.body // ""' > body.md
+
+          python3 <<'PY'
+          import re
+          from pathlib import Path
+
+          body = Path("body.md").read_text()
+          report = Path("terraform-report.md").read_text()
+
+          marker = r"<!-- terraform-ci:start -->.*?<!-- terraform-ci:end -->"
+
+          if re.search(marker, body, re.S):
+              body = re.sub(marker, report, body, flags=re.S)
+          else:
+              body = body.rstrip() + "\n\n" + report
+
+          Path("body.md").write_text(body)
+          PY
+
+          gh pr edit "$PR_NUMBER" --body-file body.md
+
+      - name: Check result
+        if: always()
+        run: |
+          if [[ \
+            "${{ steps.fmt.outcome }}" != "success" || \
+            "${{ steps.init.outcome }}" != "success" || \
+            "${{ steps.validate.outcome }}" != "success" || \
+            "${{ steps.plan.outcome }}" != "success" \
+          ]]; then
+            exit 1
+          fi
