@@ -10,10 +10,16 @@ on:
 permissions:
   contents: read
   pull-requests: write
+  id-token: write
 
 env:
   TF_IN_AUTOMATION: true
   TF_INPUT: false
+  TF_STATE_KEY: infrastructure/terraform.tfstate
+
+concurrency:
+  group: terraform-infrastructure
+  cancel-in-progress: false
 
 jobs:
   terraform:
@@ -30,10 +36,10 @@ jobs:
           terraform_wrapper: false
 
       - name: Configure AWS
-        uses: aws-actions/configure-aws-credentials@v6
+        uses: aws-actions/configure-aws-credentials@v6.2.3
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          role-to-assume: ${{ secrets.AWS_PLAN_ROLE_ARN }}
+          role-session-name: plan-session
           aws-region: ${{ secrets.AWS_REGION }}
 
       - name: Terraform format
@@ -44,7 +50,15 @@ jobs:
       - name: Terraform init
         id: init
         continue-on-error: true
-        run: terraform init -input=false
+        run: |
+          terraform init \
+            -input=false \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=$TF_STATE_KEY" \
+            -backend-config="region=${{ secrets.AWS_REGION }}" \
+            -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true"
+      
 
       - name: Terraform validate
         id: validate
@@ -62,6 +76,20 @@ jobs:
 
           terraform show -no-color tfplan > plan.txt
 
+      - name: Terraform apply
+        if: >
+          github.event_name == 'push' &&
+          github.ref == 'refs/heads/main' &&
+          steps.fmt.outcome == 'success' &&
+          steps.init.outcome == 'success' &&
+          steps.validate.outcome == 'success' &&
+          steps.plan.outcome == 'success'
+        run: |
+          terraform apply \
+            -input=false \
+            -auto-approve \
+            tfplan
+
       - name: Create report
         if: always()
         run: |
@@ -71,7 +99,7 @@ jobs:
             echo ""
             echo "| Check | Result |"
             echo "| --- | --- |"
-            echo "| Format | ${{ steps.fmt.outcome }} |"
+            echo "| Format test| ${{ steps.fmt.outcome }} |"
             echo "| Init | ${{ steps.init.outcome }} |"
             echo "| Validate | ${{ steps.validate.outcome }} |"
             echo "| Plan | ${{ steps.plan.outcome }} |"
