@@ -15,6 +15,11 @@ permissions:
 env:
   TF_IN_AUTOMATION: true
   TF_INPUT: false
+  TF_STATE_KEY: infrastructure/terraform.tfstate
+
+concurrency:
+  group: terraform-infrastructure
+  cancel-in-progress: false
 
 jobs:
   terraform:
@@ -45,7 +50,15 @@ jobs:
       - name: Terraform init
         id: init
         continue-on-error: true
-        run: terraform init -input=false
+        run: |
+          terraform init \
+            -input=false \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=$TF_STATE_KEY" \
+            -backend-config="region=${{ secrets.AWS_REGION }}" \
+            -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true"
+      
 
       - name: Terraform validate
         id: validate
@@ -62,6 +75,20 @@ jobs:
             -out=tfplan
 
           terraform show -no-color tfplan > plan.txt
+
+      - name: Terraform apply
+        if: >
+          github.event_name == 'push' &&
+          github.ref == 'refs/heads/main' &&
+          steps.fmt.outcome == 'success' &&
+          steps.init.outcome == 'success' &&
+          steps.validate.outcome == 'success' &&
+          steps.plan.outcome == 'success'
+        run: |
+          terraform apply \
+            -input=false \
+            -auto-approve \
+            tfplan
 
       - name: Create report
         if: always()
