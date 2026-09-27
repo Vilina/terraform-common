@@ -23,12 +23,17 @@ The public and private subnets are distributed across available AWS Availability
 ## Project structure
 
 ```text
-terraform-network/
+terraform-common/
+├── .github/
+│   └── workflows/
+│       ├── terraform.yaml
+│       └── terraform-destroy.yaml
 ├── terraform.tf
 ├── main.tf
 ├── variables.tf
 ├── outputs.tf
 ├── terraform.tfvars.example
+├── .terraform.lock.hcl
 ├── .gitignore
 └── README.md
 ```
@@ -48,6 +53,7 @@ It defines:
 - Minimum supported Terraform version
 - AWS provider source
 - Allowed AWS provider version range
+- S3 remote state backend
 - AWS region
 - Default tags applied to resources
 
@@ -61,10 +67,14 @@ terraform {
       version = ">= 5.0, < 7.0"
     }
   }
+
+  backend "s3" {}
 }
 ```
 
 Keeping this configuration outside `main.tf` makes it immediately clear which Terraform and provider versions the project expects.
+
+The `backend "s3" {}` block is intentionally empty (partial configuration). The bucket, key, and region are passed at `terraform init` time, so no account-specific values are committed. See [Remote state](#remote-state).
 
 The provider also applies common tags:
 
@@ -152,6 +162,8 @@ map_public_ip_on_launch = true
 ```
 
 Therefore, EC2 instances launched directly into these subnets can automatically receive public IPv4 addresses when their network interface configuration allows it.
+
+Each subnet is named `<project_name>-public-<n>` or `<project_name>-private-<n>` and gets a `Tier` tag (`public` or `private`), which makes it easy to look subnets up by tier later.
 
 Typical resources placed in public subnets include:
 
@@ -341,14 +353,12 @@ Prevents local Terraform files from being accidentally committed.
 Most importantly, it excludes:
 
 - `.terraform/`
-- Terraform state files
-- `terraform.tfvars`
-- Local plan files
-- Local override files
+- Terraform state files (`*.tfstate`, `*.tfstate.*`)
+- `terraform.tfvars` and `*.auto.tfvars`
+- Local plan files (`*.tfplan`)
+- `.idea` IDE settings
 
-Terraform state can contain infrastructure details and sometimes sensitive information, so local state should not be committed to Git.
-
-For team usage, the next step is usually to configure a remote Terraform backend instead of storing state locally.
+Terraform state can contain infrastructure details and sometimes sensitive information, so state should never be committed to Git. This project keeps state in S3 instead (see [Remote state](#remote-state)).
 
 ---
 
@@ -433,14 +443,80 @@ That is better than creating generic Security Groups in the networking project b
 
 The VPC's default Network ACL remains in place. No custom NACL is created because Security Groups are sufficient for the initial architecture and adding unnecessary NACL rules would make the setup harder to maintain.
 
+## Remote state
+
+Terraform state is stored in an S3 bucket using the S3 backend. State locking uses an S3 lock file (`use_lockfile = true`), so no DynamoDB table is needed.
+
+| Setting | Value |
+| --- | --- |
+| Bucket | Provided at init (`TF_STATE_BUCKET` secret in CI) |
+| Key | `infrastructure/terraform.tfstate` |
+| Region | Provided at init (`AWS_REGION` secret in CI) |
+| Encryption | Enabled (`encrypt = true`) |
+| Locking | S3 lock file (`use_lockfile = true`) |
+
+The state bucket is **not** created by this project. It must exist before the first `terraform init`.
+
+S3-native locking (`use_lockfile`) requires Terraform 1.10 or newer, even though `required_version` allows 1.6+.
+
+For local runs, create a `backend.hcl` file (do not commit it) with the same values CI uses:
+
+```hcl
+bucket       = "<your-state-bucket>"
+key          = "infrastructure/terraform.tfstate"
+region       = "eu-central-1"
+encrypt      = true
+use_lockfile = true
+```
+
+Then initialize with:
+
+```bash
+terraform init -backend-config=backend.hcl
+```
+
+Running plain `terraform init` without backend configuration will prompt for the missing backend values.
+
+## CI/CD
+
+GitHub Actions workflows in `.github/workflows/` run Terraform against the shared S3 state. Authentication uses GitHub OIDC to assume an AWS IAM role, so no long-lived AWS keys are stored in GitHub.
+
+### `terraform.yaml` — Terraform CI
+
+Runs on pull requests to `main` and on pushes to `main`:
+
+1. `terraform fmt -check -recursive`
+2. `terraform init` with the S3 backend configuration
+3. `terraform validate`
+4. `terraform plan`
+5. `terraform apply` of the saved plan: **only on push to `main`**, and only when all previous steps succeeded
+
+On pull requests, a report with the check results and the plan is added to the PR description. The job fails if any check fails.
+
+### `terraform-destroy.yaml` — Terraform Destroy
+
+Triggered manually (`workflow_dispatch`). It only runs when the `confirmation` input is exactly `DESTROY`, and then destroys all resources tracked in the S3 state.
+
+Both workflows share a concurrency group, so an apply and a destroy never run at the same time.
+
+### Required GitHub configuration
+
+| Name | Type | Purpose |
+| --- | --- | --- |
+| `AWS_PLAN_ROLE_ARN` | Secret | IAM role assumed through OIDC |
+| `AWS_REGION` | Secret | AWS region for the provider and the state bucket |
+| `TF_STATE_BUCKET` | Secret | Name of the S3 bucket holding Terraform state |
+| `TF_VERSION` | Variable | Terraform version installed in the workflow (1.10+) |
+
 ## Prerequisites
 
 You need:
 
-- Terraform installed
+- Terraform 1.10 or newer installed
 - AWS CLI installed or another valid AWS authentication method
 - AWS credentials configured
 - Permission to create VPC/network resources
+- An existing S3 bucket for Terraform state, and read/write access to it
 
 Verify AWS authentication with:
 
@@ -469,7 +545,7 @@ If the command succeeds, run Terraform by passing the profile through the `AWS_P
 Initialize Terraform:
 
 ```bash
-AWS_PROFILE=terraform-user terraform init
+AWS_PROFILE=terraform-user terraform init -backend-config=backend.hcl
 ```
 
 Validate the configuration:
@@ -529,10 +605,10 @@ cp terraform.tfvars.example terraform.tfvars
 ### 2. Initialize Terraform
 
 ```bash
-terraform init
+terraform init -backend-config=backend.hcl
 ```
 
-This downloads the AWS provider and prepares the Terraform working directory.
+This downloads the AWS provider, connects to the S3 state backend, and prepares the Terraform working directory. See [Remote state](#remote-state) for the contents of `backend.hcl`.
 
 ### 3. Format the code
 
